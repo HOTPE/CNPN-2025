@@ -1,0 +1,877 @@
+import React, { useMemo, useState } from "react";
+
+/**
+ * Diamond Valuation System – Single-file React demo (with Login)
+ * --------------------------------------------------------------
+ * Additions in this version:
+ * - Simple authentication dialog (mock users)
+ * - Login/Logout in top bar; role bound to logged-in user
+ * - Guarded navigation per role
+ */
+
+// ----------------------------- Utility types ------------------------------
+const Roles = [
+  "Guest",
+  "Customer",
+  "Consulting staff",
+  "Valuation staff",
+  "Manager",
+  "Admin",
+];
+
+const Pages = {
+  HOME: "Home",
+  ESTIMATE_SPECS: "Estimate by Specs",
+  ESTIMATE_CERT: "Estimate by Certificate",
+  REQUESTS: "Requests",
+  VALUATION: "Valuation",
+  CERTIFICATES: "Certificates / Print",
+  SEALING: "Sealing & Commitment",
+  PRICE_TABLE: "Price Table",
+  PARAMETERS: "Parameters",
+  PRICE_SYNC: "External Price Sync",
+  DASHBOARD: "Dashboard",
+  LOGIN: "Login",
+};
+
+// ------------------------------ Fake Storage ------------------------------
+const fakeDB = {
+  requests: [], // {id, customerName, carat, color, clarity, status}
+  valuations: [], // {requestId, valueUSD, notes, certificateNo}
+  certificates: [], // {certificateNo, requestId, pdfLikeData}
+  approvals: [], // {id, type: 'sealing'|'commitment', requestId, status}
+  priceTable: [{ service: "Standard Valuation", price: 80, leadTime: 2 }],
+  parameters: {
+    origins: ["Natural", "Lab-grown"],
+    shapes: ["Round", "Princess", "Emerald", "Oval"],
+    colors: ["D", "E", "F", "G", "H"],
+    clarities: ["IF", "VVS1", "VVS2", "VS1", "VS2"],
+    cuts: ["Excellent", "Very Good", "Good"],
+    fluorescence: ["None", "Faint", "Medium", "Strong"],
+  },
+  externalRefs: [{ source: "ExampleJewels.com", lastSync: null, count: 0 }],
+};
+
+let autoId = 1;
+
+function fakeDelay(ms = 500) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Very rough price model for demo (NOT real-life!):
+function estimatePriceUSD({ carat, color, clarity, cut, proportionsScore, polish, symmetry, fluorescence }) {
+  const base = 2000; // base per carat (fake)
+  const colorMap = { D: 1.6, E: 1.5, F: 1.4, G: 1.25, H: 1.1 };
+  const clarityMap = { IF: 1.7, VVS1: 1.5, VVS2: 1.4, VS1: 1.25, VS2: 1.15 };
+  const cutMap = { Excellent: 1.6, "Very Good": 1.35, Good: 1.1 };
+  const polishMap = { Excellent: 1.1, Very: 1.05, Good: 1.0 };
+  const symmetryMap = { Excellent: 1.1, Very: 1.05, Good: 1.0 };
+  const flMap = { None: 1.05, Faint: 1.02, Medium: 0.98, Strong: 0.93 };
+
+  const price =
+    base *
+    (Number(carat) || 0) *
+    (colorMap[color] || 1) *
+    (clarityMap[clarity] || 1) *
+    (cutMap[cut] || 1) *
+    (1 + (Number(proportionsScore) || 0) / 100) *
+    (polishMap[polish] || 1) *
+    (symmetryMap[symmetry] || 1) *
+    (flMap[fluorescence] || 1);
+  return Math.max(0, Math.round(price));
+}
+
+// ------------------------------- UI Helpers -------------------------------
+function Section({ title, children, actions }) {
+  return (
+    <div className="bg-white rounded-2xl shadow p-5 mb-5 border border-slate-100">
+      <div className="flex items-center justify-between gap-3 mb-4">
+        <h2 className="text-lg font-semibold">{title}</h2>
+        {actions}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <label className="block mb-3">
+      <span className="block text-sm text-slate-600 mb-1">{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function Button({ children, onClick, type = "button" }) {
+  return (
+    <button
+      type={type}
+      onClick={onClick}
+      className="px-4 py-2 rounded-xl shadow-sm border border-slate-200 hover:border-slate-300 active:scale-[0.99] bg-slate-50"
+    >
+      {children}
+    </button>
+  );
+}
+
+function Badge({ children }) {
+  return <span className="inline-flex px-2 py-0.5 text-xs rounded-full bg-slate-100 border border-slate-200">{children}</span>;
+}
+
+// ------------------------------ Auth (mock) -------------------------------
+const fakeUsers = [
+  { username: "customer", password: "123", role: "Customer", name: "Alice" },
+  { username: "consult", password: "123", role: "Consulting staff", name: "Bob" },
+  { username: "valuer", password: "123", role: "Valuation staff", name: "Carol" },
+  { username: "manager", password: "123", role: "Manager", name: "Diana" },
+  { username: "admin", password: "123", role: "Admin", name: "Evan" },
+];
+
+// ------------------------------ Nav by role -------------------------------
+const navByRole = {
+  Guest: [Pages.HOME, Pages.ESTIMATE_SPECS, Pages.ESTIMATE_CERT, Pages.LOGIN],
+  Customer: [Pages.HOME, Pages.ESTIMATE_SPECS, Pages.ESTIMATE_CERT, Pages.REQUESTS],
+  "Consulting staff": [Pages.REQUESTS, Pages.CERTIFICATES, Pages.DASHBOARD],
+  "Valuation staff": [Pages.VALUATION, Pages.CERTIFICATES, Pages.DASHBOARD],
+  Manager: [Pages.DASHBOARD, Pages.SEALING, Pages.CERTIFICATES, Pages.PRICE_TABLE, Pages.PARAMETERS, Pages.PRICE_SYNC],
+  Admin: [Pages.DASHBOARD, Pages.PRICE_TABLE, Pages.PARAMETERS, Pages.PRICE_SYNC],
+};
+
+// ------------------------------- Main App ---------------------------------
+export default function App() {
+  const [role, setRole] = useState("Guest");
+  const [user, setUser] = useState(null); // {name, role, username}
+  const [showLogin, setShowLogin] = useState(false);
+  const [page, setPage] = useState(Pages.HOME);
+  const [state, setState] = useState(() => ({ ...fakeDB }));
+
+  const menu = navByRole[role] || [Pages.HOME];
+
+  function setDB(updater) {
+    setState((prev) => ({ ...prev, ...updater(prev) }));
+  }
+
+  function handleLogout() {
+    setUser(null);
+    setRole("Guest");
+    setPage(Pages.HOME);
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-900">
+      {/* Top bar */}
+      <div className="sticky top-0 z-10 bg-white/80 backdrop-blur border-b border-slate-200">
+        <div className="max-w-7xl mx-auto px-4 py-3 flex items-center gap-3">
+          <div className="font-bold text-xl">💎 Diamond Valuation System</div>
+          <Badge>React demo</Badge>
+          <div className="ml-auto flex items-center gap-3">
+            {user ? (
+              <>
+                <span className="text-sm text-slate-600">Signed in as</span>
+                <Badge>{user.name} – {user.role}</Badge>
+                <Button onClick={handleLogout}>Logout</Button>
+              </>
+            ) : (
+              <Button onClick={() => setShowLogin(true)}>Login</Button>
+            )}
+            {/* Role switcher available only for demo when logged in as Admin */}
+            {user?.role === "Admin" && (
+              <>
+                <span className="text-sm text-slate-600">(Demo) Switch role</span>
+                <select
+                  className="px-3 py-1.5 rounded-xl border border-slate-300 bg-white"
+                  value={role}
+                  onChange={(e) => {
+                    const r = e.target.value;
+                    setRole(r);
+                    const first = (navByRole[r] || [Pages.HOME])[0];
+                    setPage(first);
+                  }}
+                >
+                  {Roles.map((r) => (
+                    <option key={r} value={r}>
+                      {r}
+                    </option>
+                  ))}
+                </select>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Layout */}
+      <div className="max-w-7xl mx-auto px-4 py-6 grid md:grid-cols-[240px,1fr] gap-6">
+        {/* Sidebar */}
+        <aside className="bg-white rounded-2xl border border-slate-200 shadow-sm p-3 h-fit sticky top-20">
+          <nav className="space-y-1">
+            {menu.map((item) => (
+              <button
+                key={item}
+                onClick={() => setPage(item)}
+                className={`w-full text-left px-3 py-2 rounded-xl border ${
+                  page === item ? "bg-slate-900 text-white border-slate-900" : "border-slate-200 hover:bg-slate-50"
+                }`}
+              >
+                {item}
+              </button>
+            ))}
+          </nav>
+        </aside>
+
+        {/* Main content */}
+        <main>
+          {page === Pages.HOME && <Home />}
+          {page === Pages.LOGIN && <LoginPage onOpen={() => setShowLogin(true)} />}
+          {page === Pages.ESTIMATE_SPECS && (
+            <EstimateBySpecs state={state} onSubmitRequest={(req) => addRequest(setDB, req)} />
+          )}
+          {page === Pages.ESTIMATE_CERT && <EstimateByCert state={state} />}
+          {page === Pages.REQUESTS && (
+            <RoleGate allow={["Consulting staff", "Customer", "Admin"]} role={role}>
+              <RequestsBoard state={state} onUpdate={(updater) => setDB(updater)} />
+            </RoleGate>
+          )}
+          {page === Pages.VALUATION && (
+            <RoleGate allow={["Valuation staff", "Admin"]} role={role}>
+              <ValuationWorkspace state={state} onUpdate={(updater) => setDB(updater)} />
+            </RoleGate>
+          )}
+          {page === Pages.CERTIFICATES && (
+            <RoleGate allow={["Consulting staff", "Valuation staff", "Manager", "Admin"]} role={role}>
+              <Certificates state={state} />
+            </RoleGate>
+          )}
+          {page === Pages.SEALING && (
+            <RoleGate allow={["Manager", "Admin"]} role={role}>
+              <SealingAndCommitment state={state} onUpdate={(u)=>setDB(u)} />
+            </RoleGate>
+          )}
+          {page === Pages.PRICE_TABLE && (
+            <RoleGate allow={["Manager", "Admin"]} role={role}>
+              <PriceTable state={state} onUpdate={(u)=>setDB(u)} />
+            </RoleGate>
+          )}
+          {page === Pages.PARAMETERS && (
+            <RoleGate allow={["Manager", "Admin"]} role={role}>
+              <Parameters state={state} onUpdate={(u)=>setDB(u)} />
+            </RoleGate>
+          )}
+          {page === Pages.PRICE_SYNC && (
+            <RoleGate allow={["Manager", "Admin"]} role={role}>
+              <PriceSync state={state} onUpdate={(u)=>setDB(u)} />
+            </RoleGate>
+          )}
+          {page === Pages.DASHBOARD && <Dashboard state={state} />}
+        </main>
+      </div>
+
+      {showLogin && (
+        <LoginDialog
+          onClose={() => setShowLogin(false)}
+          onSuccess={(u) => {
+            setUser(u);
+            setRole(u.role);
+            const first = (navByRole[u.role] || [Pages.HOME])[0];
+            setPage(first);
+            setShowLogin(false);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ------------------------------ Role Gate ---------------------------------
+function RoleGate({ allow, role, children }) {
+  if (!allow.includes(role)) {
+    return (
+      <Section title="Access Restricted">
+        <p className="text-slate-700">You do not have permission to view this page. Please log in with the proper role.</p>
+      </Section>
+    );
+  }
+  return children;
+}
+
+// ------------------------------ Page: Home --------------------------------
+function Home() {
+  return (
+    <div className="space-y-5">
+      <Section title="Welcome">
+        <p className="text-slate-700">
+          This is a minimal React demo for a Diamond Valuation System. Use the login button to sign in with a demo account
+          (customer/consult/valuer/manager/admin – password: 123). Admin can switch roles for demo purposes.
+        </p>
+      </Section>
+      <Section title="Public Information">
+        <ul className="list-disc pl-6 text-slate-700 space-y-1">
+          <li>Company intro, services, diamond knowledge, and blog.</li>
+          <li>Quick valuation by specs or company certificate number.</li>
+          <li>Contact & support.</li>
+        </ul>
+      </Section>
+    </div>
+  );
+}
+
+// ----------------------------- Page: Login --------------------------------
+function LoginPage({ onOpen }) {
+  return (
+    <Section title="Authentication">
+      <p className="text-slate-700 mb-3">Please sign in to access staff or management features.</p>
+      <Button onClick={onOpen}>Open Login</Button>
+    </Section>
+  );
+}
+
+function LoginDialog({ onClose, onSuccess }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+
+  function submit(e) {
+    e.preventDefault();
+    const found = fakeUsers.find((u) => u.username === username && u.password === password);
+    if (!found) return setError("Invalid credentials. Try customer/123, consult/123, valuer/123, manager/123, or admin/123.");
+    onSuccess(found);
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/30 flex items-center justify-center p-4">
+      <div className="bg-white rounded-2xl shadow-xl border border-slate-200 w-full max-w-md p-6">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-lg font-semibold">Sign in</h3>
+          <button className="text-slate-500 hover:text-slate-700" onClick={onClose}>✕</button>
+        </div>
+        <form onSubmit={submit} className="space-y-3">
+          <Field label="Username">
+            <input className="input" value={username} onChange={(e)=>setUsername(e.target.value)} placeholder="e.g., customer"/>
+          </Field>
+          <Field label="Password">
+            <input type="password" className="input" value={password} onChange={(e)=>setPassword(e.target.value)} placeholder="123"/>
+          </Field>
+          {error && <div className="text-red-600 text-sm">{error}</div>}
+          <div className="flex items-center justify-end gap-3">
+            <Button onClick={onClose} type="button">Cancel</Button>
+            <Button type="submit">Sign in</Button>
+          </div>
+        </form>
+        <div className="text-xs text-slate-500 mt-3">Demo accounts: customer/123, consult/123, valuer/123, manager/123, admin/123</div>
+      </div>
+    </div>
+  );
+}
+
+// ----------------------- Page: Estimate by Specs --------------------------
+function EstimateBySpecs({ state, onSubmitRequest }) {
+  const [form, setForm] = useState({
+    origin: "Natural",
+    shape: "Round",
+    measurements: "6.5 x 6.5 x 4.0 mm",
+    carat: 1,
+    color: "G",
+    clarity: "VS1",
+    cut: "Very Good",
+    proportionsScore: 8,
+    polish: "Very",
+    symmetry: "Very",
+    fluorescence: "None",
+    customerName: "",
+  });
+
+  const price = useMemo(() => estimatePriceUSD(form), [form]);
+
+  return (
+    <div className="space-y-5">
+      <Section title="Estimate by Specifications" actions={<Badge>Instant (demo)</Badge>}>
+        <div className="grid md:grid-cols-2 gap-4">
+          <Field label="Diamond Origin">
+            <select className="input" value={form.origin} onChange={(e)=>setForm({...form, origin:e.target.value})}>
+              {state.parameters.origins.map((o)=> <option key={o}>{o}</option>)}
+            </select>
+          </Field>
+          <Field label="Shape & Cut">
+            <select className="input" value={form.shape} onChange={(e)=>setForm({...form, shape:e.target.value})}>
+              {state.parameters.shapes.map((o)=> <option key={o}>{o}</option>)}
+            </select>
+          </Field>
+          <Field label="Measurements (mm)">
+            <input className="input" value={form.measurements} onChange={(e)=>setForm({...form, measurements:e.target.value})} />
+          </Field>
+          <Field label="Carat weight">
+            <input type="number" className="input" value={form.carat} onChange={(e)=>setForm({...form, carat:e.target.value})} />
+          </Field>
+          <Field label="Color">
+            <select className="input" value={form.color} onChange={(e)=>setForm({...form, color:e.target.value})}>
+              {state.parameters.colors.map((o)=> <option key={o}>{o}</option>)}
+            </select>
+          </Field>
+          <Field label="Clarity">
+            <select className="input" value={form.clarity} onChange={(e)=>setForm({...form, clarity:e.target.value})}>
+              {state.parameters.clarities.map((o)=> <option key={o}>{o}</option>)}
+            </select>
+          </Field>
+          <Field label="Cut">
+            <select className="input" value={form.cut} onChange={(e)=>setForm({...form, cut:e.target.value})}>
+              {state.parameters.cuts.map((o)=> <option key={o}>{o}</option>)}
+            </select>
+          </Field>
+          <Field label="Proportions score (0–20)">
+            <input type="number" className="input" value={form.proportionsScore} onChange={(e)=>setForm({...form, proportionsScore:e.target.value})} />
+          </Field>
+          <Field label="Polish">
+            <select className="input" value={form.polish} onChange={(e)=>setForm({...form, polish:e.target.value})}>
+              {['Excellent','Very','Good'].map((o)=> <option key={o}>{o}</option>)}
+            </select>
+          </Field>
+          <Field label="Symmetry">
+            <select className="input" value={form.symmetry} onChange={(e)=>setForm({...form, symmetry:e.target.value})}>
+              {['Excellent','Very','Good'].map((o)=> <option key={o}>{o}</option>)}
+            </select>
+          </Field>
+          <Field label="Fluorescence">
+            <select className="input" value={form.fluorescence} onChange={(e)=>setForm({...form, fluorescence:e.target.value})}>
+              {state.parameters.fluorescence.map((o)=> <option key={o}>{o}</option>)}
+            </select>
+          </Field>
+          <Field label="Customer name (optional to create request)">
+            <input className="input" value={form.customerName} onChange={(e)=>setForm({...form, customerName:e.target.value})} />
+          </Field>
+        </div>
+        <div className="mt-4 flex items-center gap-3">
+          <Badge>Estimated price</Badge>
+          <div className="text-2xl font-bold">${price.toLocaleString()}</div>
+          <div className="ml-auto flex gap-3">
+            <Button onClick={() => onSubmitRequest(form)}>Create Request from This</Button>
+          </div>
+        </div>
+      </Section>
+    </div>
+  );
+}
+
+// -------------------- Page: Estimate by Certificate -----------------------
+function EstimateByCert({ state }) {
+  const [certNo, setCertNo] = useState("");
+  const [result, setResult] = useState(null);
+
+  async function handleLookup() {
+    await fakeDelay(400);
+    // Very naive: try to find valuation with same certificate number
+    const found = state.valuations.find((v) => v.certificateNo === certNo);
+    setResult(found || { error: "Certificate not found in company database." });
+  }
+
+  return (
+    <Section title="Estimate by Certificate Number">
+      <div className="flex gap-3 items-end">
+        <Field label="Certificate Number">
+          <input className="input" value={certNo} onChange={(e)=>setCertNo(e.target.value)} placeholder="e.g., C-2025-0001"/>
+        </Field>
+        <Button onClick={handleLookup}>Lookup</Button>
+      </div>
+
+      {result && (
+        <div className="mt-4">
+          {result.error ? (
+            <div className="text-red-600">{result.error}</div>
+          ) : (
+            <div className="space-y-2">
+              <div><Badge>Request</Badge> #{result.requestId}</div>
+              <div><Badge>Estimated Value</Badge> ${result.valueUSD.toLocaleString()}</div>
+              <div><Badge>Certificate</Badge> {result.certificateNo}</div>
+              <div className="text-slate-600 text-sm">(Demo data from internal valuations)</div>
+            </div>
+          )}
+        </div>
+      )}
+    </Section>
+  );
+}
+
+// --------------------------- Page: Requests board -------------------------
+function addRequest(setDB, form) {
+  const id = autoId++;
+  const req = {
+    id,
+    customerName: form.customerName || "Guest",
+    carat: Number(form.carat) || 0,
+    color: form.color,
+    clarity: form.clarity,
+    status: "New",
+  };
+  setDB(() => (prev) => ({ requests: [...prev.requests, req] }));
+  alert(`Request #${id} created.`);
+}
+
+function RequestsBoard({ state, onUpdate }) {
+  function moveStatus(id, status) {
+    onUpdate(() => (prev) => ({
+      requests: prev.requests.map((r) => (r.id === id ? { ...r, status } : r)),
+    }));
+  }
+
+  return (
+    <Section title="Requests – Consulting Staff">
+      <div className="grid md:grid-cols-3 gap-4">
+        {["New", "In Progress", "Completed"].map((col) => (
+          <div key={col} className="bg-slate-100 rounded-xl p-3 border border-slate-200">
+            <div className="font-semibold mb-2">{col}</div>
+            <div className="space-y-2">
+              {state.requests.filter((r) => r.status === col).map((r) => (
+                <div key={r.id} className="bg-white border border-slate-200 rounded-xl p-3">
+                  <div className="flex justify-between items-start">
+                    <div>
+                      <div className="font-medium">Request #{r.id}</div>
+                      <div className="text-sm text-slate-600">{r.customerName} • {r.carat}ct • {r.color}/{r.clarity}</div>
+                    </div>
+                    <div className="flex gap-2">
+                      {col !== "New" && <Button onClick={()=>moveStatus(r.id, "New")}>To New</Button>}
+                      {col !== "In Progress" && <Button onClick={()=>moveStatus(r.id, "In Progress")}>To Progress</Button>}
+                      {col !== "Completed" && <Button onClick={()=>moveStatus(r.id, "Completed")}>Done</Button>}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </Section>
+  );
+}
+
+// ----------------------- Page: Valuation workspace ------------------------
+function ValuationWorkspace({ state, onUpdate }) {
+  const [selected, setSelected] = useState(null);
+  const [notes, setNotes] = useState("");
+
+  function selectForValuation(req) {
+    setSelected(req);
+    setNotes("");
+  }
+
+  function performValuation() {
+    if (!selected) return;
+    const valueUSD = estimatePriceUSD({
+      carat: selected.carat,
+      color: selected.color,
+      clarity: selected.clarity,
+      cut: "Very Good",
+      proportionsScore: 6,
+      polish: "Very",
+      symmetry: "Very",
+      fluorescence: "None",
+    });
+    const certificateNo = `C-${new Date().getFullYear()}-${String(selected.id).padStart(4, "0")}`;
+
+    onUpdate(() => (prev) => ({
+      valuations: [...prev.valuations, { requestId: selected.id, valueUSD, notes, certificateNo }],
+      certificates: [...prev.certificates, { certificateNo, requestId: selected.id, pdfLikeData: { valueUSD } }],
+      requests: prev.requests.map((r) => (r.id === selected.id ? { ...r, status: "Completed" } : r)),
+    }));
+
+    alert(`Valuation completed. Certificate: ${certificateNo}`);
+    setSelected(null);
+    setNotes("");
+  }
+
+  return (
+    <div className="space-y-5">
+      <Section title="Pending Requests">
+        <div className="grid md:grid-cols-2 gap-3">
+          {state.requests.filter((r)=>r.status!=="Completed").map((r)=>(
+            <div key={r.id} className="bg-white border border-slate-200 rounded-xl p-3 flex items-center justify-between">
+              <div>
+                <div className="font-medium">Request #{r.id}</div>
+                <div className="text-sm text-slate-600">{r.customerName} • {r.carat}ct • {r.color}/{r.clarity}</div>
+              </div>
+              <Button onClick={()=>selectForValuation(r)}>Select</Button>
+            </div>
+          ))}
+        </div>
+      </Section>
+
+      <Section title="Valuation Panel" actions={selected && <Badge>Request #{selected.id}</Badge>}>
+        {selected ? (
+          <div className="space-y-3">
+            <div className="text-slate-700">Enter notes (internal):</div>
+            <textarea className="input h-28" value={notes} onChange={(e)=>setNotes(e.target.value)} />
+            <div className="flex gap-3">
+              <Button onClick={performValuation}>Complete & Generate Certificate</Button>
+              <Button onClick={()=>{setSelected(null); setNotes("");}}>Cancel</Button>
+            </div>
+          </div>
+        ) : (
+          <div className="text-slate-600">Select a request to start valuation.</div>
+        )}
+      </Section>
+    </div>
+  );
+}
+
+// -------------------------- Page: Certificates ----------------------------
+function Certificates({ state }) {
+  const [selected, setSelected] = useState(null);
+  return (
+    <div className="space-y-5">
+      <Section title="Certificates">
+        <div className="grid md:grid-cols-2 gap-3">
+          {state.certificates.map((c) => (
+            <div key={c.certificateNo} className="bg-white border border-slate-200 rounded-xl p-3 flex items-center justify-between">
+              <div>
+                <div className="font-medium">{c.certificateNo}</div>
+                <div className="text-sm text-slate-600">Request #{c.requestId}</div>
+              </div>
+              <div className="flex gap-2">
+                <Button onClick={()=>setSelected(c)}>Preview</Button>
+                <Button onClick={()=>window.print()}>Print</Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </Section>
+
+      {selected && (
+        <Section title="Certificate Preview">
+          <div className="bg-white border border-slate-300 rounded-xl p-6 print:border-0 print:shadow-none">
+            <h3 className="text-xl font-bold mb-2">Diamond Valuation Certificate</h3>
+            <div className="text-sm text-slate-700">Certificate No: {selected.certificateNo}</div>
+            <div className="text-sm text-slate-700 mb-4">Request ID: {selected.requestId}</div>
+            <div className="text-lg">Estimated Value: ${selected.pdfLikeData.valueUSD.toLocaleString()}</div>
+            <div className="mt-6 text-xs text-slate-500">* Demo preview. Use your company template here.</div>
+          </div>
+        </Section>
+      )}
+    </div>
+  );
+}
+
+// ------------------- Page: Sealing & Commitment (Manager) -----------------
+function SealingAndCommitment({ state, onUpdate }) {
+  const [requestId, setRequestId] = useState("");
+  const [type, setType] = useState("sealing");
+
+  function createApproval() {
+    const id = autoId++;
+    onUpdate(() => (prev) => ({
+      approvals: [...prev.approvals, { id, type, requestId: Number(requestId), status: "Pending" }],
+    }));
+    setRequestId("");
+  }
+
+  function setStatus(id, status) {
+    onUpdate(() => (prev) => ({
+      approvals: prev.approvals.map((a) => (a.id === id ? { ...a, status } : a)),
+    }));
+  }
+
+  return (
+    <div className="space-y-5">
+      <Section title="Create Sealing/Commitment Request">
+        <div className="grid md:grid-cols-3 gap-3">
+          <Field label="Request ID">
+            <input className="input" value={requestId} onChange={(e)=>setRequestId(e.target.value)} />
+          </Field>
+          <Field label="Type">
+            <select className="input" value={type} onChange={(e)=>setType(e.target.value)}>
+              <option value="sealing">Sealing record</option>
+              <option value="commitment">Commitment paper</option>
+            </select>
+          </Field>
+          <div className="flex items-end"><Button onClick={createApproval}>Submit</Button></div>
+        </div>
+      </Section>
+
+      <Section title="Approvals – Manager">
+        <div className="space-y-2">
+          {state.approvals.map((a) => (
+            <div key={a.id} className="bg-white border border-slate-200 rounded-xl p-3 flex items-center justify-between">
+              <div>
+                <div className="font-medium">#{a.id} • {a.type === 'sealing' ? 'Sealing' : 'Commitment'}</div>
+                <div className="text-sm text-slate-600">Request {a.requestId}</div>
+              </div>
+              <div className="flex gap-2 items-center">
+                <Badge>{a.status}</Badge>
+                {a.status !== "Approved" && <Button onClick={()=>setStatus(a.id,'Approved')}>Approve</Button>}
+                {a.status !== "Rejected" && <Button onClick={()=>setStatus(a.id,'Rejected')}>Reject</Button>}
+              </div>
+            </div>
+          ))}
+        </div>
+      </Section>
+    </div>
+  );
+}
+
+// ----------------------------- Page: Price table --------------------------
+function PriceTable({ state, onUpdate }) {
+  const [service, setService] = useState("");
+  const [price, setPrice] = useState("");
+  const [leadTime, setLeadTime] = useState("");
+
+  function addRow() {
+    onUpdate(() => (prev) => ({
+      priceTable: [...prev.priceTable, { service, price: Number(price)||0, leadTime: Number(leadTime)||0 }],
+    }));
+    setService(""); setPrice(""); setLeadTime("");
+  }
+
+  return (
+    <div className="space-y-5">
+      <Section title="Service Price Table">
+        <div className="grid md:grid-cols-4 gap-3">
+          <Field label="Service">
+            <input className="input" value={service} onChange={(e)=>setService(e.target.value)} />
+          </Field>
+          <Field label="Price (USD)">
+            <input type="number" className="input" value={price} onChange={(e)=>setPrice(e.target.value)} />
+          </Field>
+          <Field label="Lead time (days)">
+            <input type="number" className="input" value={leadTime} onChange={(e)=>setLeadTime(e.target.value)} />
+          </Field>
+          <div className="flex items-end"><Button onClick={addRow}>Add</Button></div>
+        </div>
+
+        <div className="mt-4 overflow-x-auto">
+          <table className="min-w-full text-sm">
+            <thead>
+              <tr className="text-left text-slate-600">
+                <th className="py-2 pr-3">Service</th>
+                <th className="py-2 pr-3">Price</th>
+                <th className="py-2 pr-3">Lead time</th>
+              </tr>
+            </thead>
+            <tbody>
+              {state.priceTable.map((r, i) => (
+                <tr key={i} className="border-t">
+                  <td className="py-2 pr-3">{r.service}</td>
+                  <td className="py-2 pr-3">${r.price}</td>
+                  <td className="py-2 pr-3">{r.leadTime}d</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Section>
+    </div>
+  );
+}
+
+// ----------------------------- Page: Parameters ---------------------------
+function Parameters({ state, onUpdate }) {
+  const [group, setGroup] = useState("origins");
+  const [item, setItem] = useState("");
+
+  function addParam() {
+    onUpdate(() => (prev) => ({
+      parameters: { ...prev.parameters, [group]: [...prev.parameters[group], item] },
+    }));
+    setItem("");
+  }
+
+  return (
+    <Section title="Valuation Parameters">
+      <div className="grid md:grid-cols-[200px,1fr] gap-4">
+        <div className="space-y-2">
+          {Object.keys(state.parameters).map((k) => (
+            <button key={k} onClick={()=>setGroup(k)} className={`w-full text-left px-3 py-2 rounded-xl border ${group===k? 'bg-slate-900 text-white border-slate-900':'border-slate-200 hover:bg-slate-50'}`}>{k}</button>
+          ))}
+        </div>
+        <div>
+          <div className="flex items-end gap-3 mb-3">
+            <Field label={`Add to ${group}`}>
+              <input className="input" value={item} onChange={(e)=>setItem(e.target.value)} />
+            </Field>
+            <Button onClick={addParam}>Add</Button>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {state.parameters[group].map((v, i) => (
+              <span key={i} className="px-3 py-1 rounded-full bg-slate-100 border border-slate-200 text-sm">{v}</span>
+            ))}
+          </div>
+        </div>
+      </div>
+    </Section>
+  );
+}
+
+// --------------------------- Page: External Price Sync --------------------
+function PriceSync({ state, onUpdate }) {
+  const [loading, setLoading] = useState(false);
+
+  async function sync(idx) {
+    setLoading(true);
+    await fakeDelay(800);
+    onUpdate(() => (prev) => ({
+      externalRefs: prev.externalRefs.map((r, i) => (i === idx ? { ...r, lastSync: new Date().toISOString(), count: r.count + 100 } : r)),
+    }));
+    setLoading(false);
+  }
+
+  return (
+    <Section title="External Pricing Sources">
+      <div className="space-y-3">
+        {state.externalRefs.map((r, i) => (
+          <div key={i} className="bg-white border border-slate-200 rounded-xl p-3 flex items-center justify-between">
+            <div>
+              <div className="font-medium">{r.source}</div>
+              <div className="text-sm text-slate-600">Last sync: {r.lastSync || '—'} • Items: {r.count}</div>
+            </div>
+            <Button onClick={()=>sync(i)}>{loading? 'Syncing…':'Sync now'}</Button>
+          </div>
+        ))}
+      </div>
+    </Section>
+  );
+}
+
+// -------------------------------- Dashboard -------------------------------
+function Dashboard({ state }) {
+  const stats = useMemo(() => {
+    const totalReq = state.requests.length;
+    const completed = state.requests.filter((r) => r.status === "Completed").length;
+    const inProgress = state.requests.filter((r) => r.status === "In Progress").length;
+    const valuationCount = state.valuations.length;
+    const revenue = state.priceTable.reduce((s, r) => s + r.price, 0);
+    return { totalReq, completed, inProgress, valuationCount, revenue };
+  }, [state]);
+
+  return (
+    <div className="space-y-5">
+      <Section title="Dashboard Overview">
+        <div className="grid md:grid-cols-3 gap-4">
+          <StatCard label="Total Requests" value={stats.totalReq} />
+          <StatCard label="In Progress" value={stats.inProgress} />
+          <StatCard label="Completed" value={stats.completed} />
+          <StatCard label="Valuations" value={stats.valuationCount} />
+          <StatCard label="Service Types (sum price)" value={`$${stats.revenue}`} />
+          <StatCard label="Certificates" value={state.certificates.length} />
+        </div>
+      </Section>
+    </div>
+  );
+}
+
+function StatCard({ label, value }) {
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white p-4">
+      <div className="text-sm text-slate-600">{label}</div>
+      <div className="text-2xl font-bold">{String(value)}</div>
+    </div>
+  );
+}
+
+// ------------------------------- Styles -----------------------------------
+// Tiny form style shortcut
+const inputBase = `w-full px-3 py-2 rounded-xl border border-slate-300 bg-white focus:outline-none focus:ring-2 focus:ring-slate-300`;
+// Attach to window so we can reuse class easily inside jsx (for this single-file demo)
+// eslint-disable-next-line no-unused-vars
+const _inject = (function(){
+  const style = document.createElement('style');
+  style.innerHTML = `.input{${inputBase.replaceAll("`", "\``")}}`;
+  document.head.appendChild(style);
+  return true;
+})();
